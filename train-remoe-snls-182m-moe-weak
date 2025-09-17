@@ -1,0 +1,215 @@
+#!/bin/bash
+#SBATCH --job-name=train-remoe-snls-182m-moe
+#SBATCH --cpus-per-task=16
+#SBATCH --ntasks-per-node=4
+#SBATCH --nodes=1 # if 8 means micro batch is 2
+#SBATCH --partition=gpu_a100 # gpu_a100 or gpu_h100
+#SBATCH --time=02:00:00
+#SBATCH --gpus-per-node=4
+#SBATCH --output logs/remoe-182m-moe/%j.out
+#SBATCH --error logs/remoe-182m-moe/%j.err
+
+# config adapted from https://github.com/thu-ml/ReMoE/blob/main/scripts/train_llama_978m_moe.sh
+# and https://github.com/SURF-ML/Megatron-LM-Snellius/blob/main/train-gpt.job
+
+# Basic SLURM-derived variables
+NUM_TOT_GPUS=$((SLURM_NNODES * SLURM_GPUS_ON_NODE))
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=9999
+export WORLD_SIZE=${SLURM_NTASKS:-$(( ${SLURM_GPUS_PER_NODE:-1} * ${SLURM_NNODES:-2} ))}
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_NODE:-2}
+
+# Paths
+export PROJECT_DIR="/projects/0/prjsxxxx/"
+BIND_DIRS="/scratch-shared/$USER,$PROJECT_SPACE"
+BASE_DIR="$PWD"
+OUTPUT_DIR="/scratch-shared/$USER/Megatron-LM/output-$SLURM_JOBID"
+CHECKPOINT_PATH="${OUTPUT_DIR}/checkpoints"
+TENSORBOARD_DIR="${OUTPUT_DIR}/tensorboard/$SLURM_JOB_NAME-$SLURM_JOBID"
+MEGATRON_CACHE_FOLDER="/scratch-shared/$USER/megatron_cache"
+CONTAINER=$PROJECT_DIR/containers/megatron-torch-2.7-nvcr.25-04.sif
+DATA_PATH=$PROJECT_DIR/datasets/FineWeb/fineweb-10BT_text_document
+VOCAB_FILE="$HOME/tokenizers/models--gpt2/vocab.json"
+MERGE_FILE="$HOME/tokenizers/models--gpt2/merges.txt"
+
+mkdir -p "$OUTPUT_DIR" "$CHECKPOINT_PATH" "$MEGATRON_CACHE_FOLDER"
+
+LAUNCH_SCRIPT="$BASE_DIR/launch.sh"
+
+# Apptainer cache
+export APPTAINER_CACHEDIR="${MEGATRON_CACHE_FOLDER}/APPTAINER_CACHEDIR"
+export APPTAINER_TMPDIR="${MEGATRON_CACHE_FOLDER}/APPTAINER_TMPDIR"
+mkdir -p $APPTAINER_CACHEDIR $APPTAINER_TMPDIR
+
+DATA_CACHE_PATH="/scratch-shared/$USER/megatron_cache"
+export XDG_CACHE_PATH="/scratch-shared/$USER/"
+export TRITON_CACHE_DIR="/scratch-shared/$USER/.triton/"
+export TRITON_LIBCUDA_PATH="/scratch-shared/$USER/local/cuda/compat/lib.real/libcuda.so.1"
+
+# Env setup
+module purge
+if [[ "$SLURM_JOB_PARTITION" == "gpu_h100" ]]; then
+    module load 2024 NCCL/2.22.3-GCCcore-13.3.0-CUDA-12.6.0     # h100
+elif [[ "$SLURM_JOB_PARTITION" == "gpu_a100" ]]; then 
+    module load 2023 NCCL/2.18.3-GCCcore-12.3.0-CUDA-12.1.1     # a100
+else
+    echo "WARNING! - Partition is not gpu_h100 or gpu_a100: ${SLURM_JOB_PARTITION}"
+fi
+
+export PYTHONUSERBASE=""
+export CC=gcc
+export CXX=g++
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTHONWARNINGS=ignore
+export NVTE_DEBUG=0
+export NVTE_DEBUG_LEVEL=0
+
+# Training config
+# Strong scaling
+# GLOBAL_BATCH_SIZE=64
+# MICRO_BATCH_SIZE=$((${GLOBAL_BATCH_SIZE} / ${NUM_TOT_GPUS}))
+# Weak scaling
+MICRO_BATCH_SIZE=4
+GLOBAL_BATCH_SIZE=$((${MICRO_BATCH_SIZE} * ${NUM_TOT_GPUS}))
+
+# WandB config
+export WANDB_API_KEY= # API key here (wandb.ai/authorize)
+export WANDB_ENTITY=oellm-team
+export WANDB_PROJECT=remoe-scaling
+export WANDB_MODE=online
+
+# Argument groups
+DATA_ARGS=(
+    --data-path "$DATA_PATH"
+    --data-cache-path "$MEGATRON_CACHE_FOLDER"
+    --vocab-file ${VOCAB_FILE}
+    --merge-file ${MERGE_FILE}
+    --make-vocab-size-divisible-by 128
+    --dataloader-type single
+    --num-workers 2
+    --split 969,30,1
+)
+
+MODEL_ARGS=(
+    --use-mcore-models
+    --disable-bias-linear
+    --seq-length 1024
+    --max-position-embeddings 1024
+    --num-layers 12
+    --hidden-size 768
+    --ffn-hidden-size $((768 * 4))
+    --num-attention-heads 12
+    --init-method-std 0.01
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --normalization RMSNorm
+    --position-embedding-type rope
+    --swiglu
+    --untie-embeddings-and-output-weights
+    --group-query-attention
+    --num-query-groups 4
+    --no-masked-softmax-fusion
+    --no-position-embedding
+    --rotary-base 1000000
+    --use-flash-attn
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers 1
+)
+
+MOE_ARGS=(
+    --num-experts 8
+    --moe-router-topk 1
+    --moe-router-load-balancing-type aux_loss
+    --moe-aux-loss-coeff 1e-2
+    --moe-token-dispatcher-type alltoall
+    --overlap-param-gather
+    --overlap-grad-reduce
+    --moe-router-pre-softmax
+    --moe-grouped-gemm
+)
+
+TRAINING_ARGS=(
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --lr 5e-4
+    --train-iters 2000
+    --lr-decay-style cosine
+    --min-lr 5e-5
+    --lr-warmup-fraction 0.01
+    --clip-grad 1.0
+    --bf16
+)
+
+MODEL_PARALLEL_ARGS=(
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 1
+    --expert-model-parallel-size 1
+    --use-distributed-optimizer
+    --sequence-parallel
+)
+
+OUTPUT_ARGS=(
+    --eval-interval 5000
+    --eval-iters 100
+    --tensorboard-dir "$TENSORBOARD_DIR"
+    --tensorboard-queue-size 5
+    --log-throughput
+    --log-timers-to-tensorboard
+    --log-progress
+    --log-interval 1
+    --tensorboard-log-interval 1
+)
+
+CHECKPOINT_ARGS=(
+    --ckpt-format torch
+    --load "$CHECKPOINT_PATH"
+    --save "$CHECKPOINT_PATH"
+    --save-interval 1000
+)
+
+# WandB
+if [ -n "$WANDB_API_KEY" ]; then
+    WANDB_DIR="$OUTPUT_DIR/wandb/$SLURM_JOB_NAME-$SLURM_JOBID"
+    mkdir -p $WANDB_DIR
+    WANDB_ARGS=(
+        --wandb-project $WANDB_PROJECT
+        --wandb-exp-name "SNLS-${SLURM_JOBID}-182M-${SLURM_NNODES}n-${MICRO_BATCH_SIZE}mbs-${EXPERT_MODEL_PARALLEL_SIZE}ep-moe-weak-${SLURM_JOB_PARTITION}"
+        --wandb-save-dir $WANDB_DIR
+    )
+else
+    WANDB_ARGS=()
+fi
+
+# Command
+MEGATRON_PATH="$PWD/Megatron-LM"
+COMMAND="${MEGATRON_PATH}/pretrain_gpt.py \
+    ${MODEL_ARGS[@]} \
+    ${TRAINING_ARGS[@]} \
+    ${MODEL_PARALLEL_ARGS[@]} \
+    ${OUTPUT_ARGS[@]} \
+    ${CHECKPOINT_ARGS[@]} \
+    ${DATA_ARGS[@]} \
+    ${MOE_ARGS[@]} \
+    ${WANDB_ARGS[@]}"
+
+echo "========== COMMAND: =========="
+echo "$COMMAND"
+echo "=============================="
+
+echo "START $SLURM_JOBID: $(date)"
+echo "SLURM_NNODES: $SLURM_NNODES"
+echo "SLURM_GPUS_ON_NODE: $SLURM_GPUS_ON_NODE"
+echo "NUM_TOT_GPUS: $NUM_TOT_GPUS"
+
+srun \
+    --label \
+    apptainer exec \
+    --nv \
+    -B "$BASE_DIR" \
+    -B "$BIND_DIRS" \
+    "$CONTAINER" \
+    "$LAUNCH_SCRIPT" \
+    $COMMAND
+
+echo "END $SLURM_JOBID: $(date)"
