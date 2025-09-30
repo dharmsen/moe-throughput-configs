@@ -23,17 +23,24 @@ export SCRATCH_DIR=/p/scratch/laionize/$USER
 export PROJECT_DIR=/p/project1/laionize/${USER}_jewelsbooster
 mkdir -p $SCRATCH_DIR/logs/moe-scaling/slurm_logs
 
+# Env setup
+module purge
+module load Stages/2025 GCCcore/.13.3.0 Python/3.12.3 NCCL/default-CUDA-12
+# export VENV_PATH="$PROJECT_DIR/moe-scaling/.venv"
+# source $VENV_PATH/bin/activate
+
+
 NUM_TOT_GPUS=$((SLURM_NNODES * SLURM_GPUS_ON_NODE))
-export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
-# if [ "$SYSTEMNAME" = juwelsbooster ] \
-#        || [ "$SYSTEMNAME" = juwels ] \
-#        || [ "$SYSTEMNAME" = jurecadc ] \
-#        || [ "$SYSTEMNAME" = jusuf ]; then
-    # Usage of InfiniBand interfance is not automatic.
-    # To allow communication over InfiniBand cells on JSC machines append "i" to the hostname.
-    # MASTER_ADDR="$MASTER_ADDR"i
-# fi
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+MASTER_ADDR=${MASTER_ADDR}i
+# MASTER_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)i
+# MASTER_ADDR=$(getent ahostsv4 $MASTER_HOST | awk '{print $1; exit}')
+echo $MASTER_ADDR
 export MASTER_PORT=39591
+
+export RANK=$SLURM_PROCID
+export LOCAL_RANK=$SLURM_LOCALID
+export WORLD_SIZE=$SLURM_NTASKS
 
 DISTRIBUTED_ARGS=(
     --nproc-per-node $SLURM_GPUS_PER_NODE
@@ -50,7 +57,8 @@ OUTPUT_DIR="$SCRATCH_DIR/Megatron-LM/output-$SLURM_JOBID"
 CHECKPOINT_PATH="${OUTPUT_DIR}/checkpoints"
 TENSORBOARD_DIR="${OUTPUT_DIR}/tensorboard/$SLURM_JOB_NAME-$SLURM_JOBID"
 MEGATRON_CACHE_FOLDER="$SCRATCH_DIR/megatron_cache"
-CONTAINER="${PROJECT_DIR}/container/megatron-torch-2.7.nvcr.25-04.sif"
+# CONTAINER="${PROJECT_DIR}/container/megatron-torch-2.7.nvcr.25-04.sif"
+CONTAINER="${PROJECT_DIR}/container/megatron-torch-2.7-nvcr.25-04-torchrun_jsc.sif"
 DATA_PATH="/p/project1/laionize/onutu2_juwelsbooster/datasets/FineWeb/fineweb-10BT_text_document"
 
 mkdir -p "$OUTPUT_DIR" "$CHECKPOINT_PATH" "$TENSORBOARD_DIR" "$MEGATRON_CACHE_FOLDER"
@@ -66,12 +74,6 @@ VOCAB_FILE="${HF_HOME}/hub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721
 MERGE_FILE="${HF_HOME}/hub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/merges.txt"
 TOKENIZER_DIR=$HF_HOME/hub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/
 
-# Env setup
-module purge
-module load Stages/2025 GCCcore/.13.3.0 Python/3.12.3 NCCL/default-CUDA-12
-# export VENV_PATH="$PROJECT_DIR/moe-scaling/.venv"
-# source $VENV_PATH/bin/activate
-
 export PYTHONUSERBASE=""
 export CC=gcc
 export CXX=g++
@@ -86,7 +88,7 @@ export NCCL_IB_HCA=mlx5_0
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-MICRO_BATCH_SIZE=4
+MICRO_BATCH_SIZE=32
 GLOBAL_BATCH_SIZE=$((${MICRO_BATCH_SIZE} * ${NUM_TOT_GPUS}))
 EXPERT_MODEL_PARALLEL_SIZE=1
 
@@ -230,15 +232,22 @@ echo "NUM_TOT_GPUS: $NUM_TOT_GPUS"
 # srun env -u CUDA_VISIBLE_DEVICES torchrun_jsc "${DISTRIBUTED_ARGS[@]}" \
 #     "$LAUNCH_SCRIPT" $COMMAND
 # srun torchrun_jsc "${DISTRIBUTED_ARGS[@]}" $COMMAND
+
 srun \
-        --label \
-        apptainer exec \
+    --label \
+    env -u CUDA_VISIBLE_DEVICES \
+    apptainer exec \
         --nv \
         -B "$BASE_DIR" \
         -B "$BIND_DIRS" \
         "$CONTAINER" \
-        "$LAUNCH_SCRIPT" \
-        "${MEGATRON_PATH}/pretrain_gpt.py" "${ARGS[@]}"
-
+        torchrun_jsc \
+            "${DISTRIBUTED_ARGS[@]}" \
+            --rdzv_id=$SLURM_JOBID \
+            --rdzv_backend=c10d \
+            --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+            --master_addr=$MASTER_ADDR \
+            --master_port=$MASTER_PORT \
+            "${MEGATRON_PATH}/pretrain_gpt.py" "${ARGS[@]}"
 
 echo "END $SLURM_JOBID: $(date)"
