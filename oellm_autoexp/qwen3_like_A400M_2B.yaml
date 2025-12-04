@@ -1,0 +1,171 @@
+defaults:
+  - base_defaults
+  - _self_
+
+
+##############################################
+### -- Core model architecture settings -- ###
+##############################################
+num_layers: 12
+hidden_size: 1024
+ffn_hidden_size: 5760
+num_attention_heads: 16
+group_query_attention: False
+num_query_groups: 16 # no gqa when NUM_QUERY_GROUPS==NUM_ATTENTION_HEADS TODO: check
+kv_channels: 64
+
+moe_router_topk: 8
+moe_ffn_hidden_size: 672
+num_experts: 64
+moe_grouped_gemm: True 
+moe_aux_loss_coeff: 0.01
+# moe_z_loss_coeff: None
+
+position_embedding_type: "rope"
+max_position_embeddings: 2048
+rotary_base: 10000
+rotary_percent: 1.0
+seq_length: 2048
+init_method_std: 0.02
+attention_dropout: 0.0
+hidden_dropout: 0.0
+normalization: RMSNorm
+norm_epsilon: 1.e-5 # rmsnorm epsilon
+qk_layernorm: False # potentially enable qk-norm
+swiglu: True
+untie_embeddings_and_output_weights: False
+disable_bias_linear: True
+
+
+###############################
+### -- Training settings -- ###
+###############################
+micro_batch_size: 4
+global_batch_size: 1024
+lr: [0.0003] #, 3e-4] # 1e-3, 5e-4
+
+min_lr: 0.0
+lr_decay_style: WSD
+lr_wsd_decay_style: linear
+
+## Specify one of these only!
+# lr_warmup_iters: null
+# lr_warmup_samples: null
+lr_warmup_fraction: 0.1
+
+## Specify one of these only!
+# lr_decay_iters: null
+# lr_decay_samples: null
+lr_decay_fraction: 0.2 
+
+## Specify one of these only!
+# train_iters: null
+# train_samples: null
+train_tokens: 100_000_000_000
+
+recompute_activations: False
+
+eval_interval: 5000
+eval_iters: 100
+
+
+################################################
+### -- Precision and performance settings -- ###
+################################################
+bf16: True
+use_flash_attn: True
+attention_softmax_in_fp32: False
+no_gradient_accumulation_fusion: True
+no_bias_swiglu_fusion: True
+no_bias_dropout_fusion: True
+# these args substantially improve TFLOP/s/GPU (1.7B model on 54 nodes, 160 vs 140 with vs without)
+overlap_param_gather: True
+overlap_grad_reduce: True
+overlap_param_gather_with_optimizer_step: False # with interleaved pipeline parallelism
+
+
+###################################
+### -- Optimization settings -- ###
+###################################
+optimizer: adam
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_eps: 1.e-8
+clip_grad: 1.0
+weight_decay: 0.05
+
+
+################################
+### -- Tokenizer settings -- ###
+################################
+tokenizer_type: HuggingFaceTokenizer
+tokenizer_model: "EleutherAI/gpt-neox-20b"
+
+
+###################################
+### -- Data loading settings -- ###
+###################################
+# mock_data: True
+data_path: [ # TODO MAKE ENVIRONMENT AGNOSTIC
+    # Neomtron-CC HQ
+    1.0 /scratch/project_462000963/users/vitiugin/data_tok/hplt3_eng_cleaned_sample
+    # 1.0 /scratch/project_462000963/preprocessed/gemma-3/nemotron-cc/high-actual
+]
+data_cache_path: .data/cache
+num_workers: 5
+split: '969,30,1'
+
+
+##############################
+### -- Logging settings -- ###
+##############################
+log_interval: 1
+log_progress: True
+log_throughput: True
+tensorboard_queue_size: 5
+# TODO MAKE ENVIRONMENT AGNOSTIC
+# WANDB NAME, also used as JOB_NAME
+wandb_exp_name: oellm_a400M_2B_dryrun
+wandb_project: oellm-train
+
+profile: False
+use_pytorch_profiler: False
+profile_ranks: [0]
+profile_step_start: 5
+profile_step_end: 12
+
+
+############################################
+### -- Distributed optimizer settings -- ###
+############################################
+# num_layers_per_virtual_pipeline_stage: null # interleaved pipeline scheduling is only possible with pipeline parallel degree > 1.
+use_distributed_optimizer: True
+
+
+#########################################################
+### -- Distributed training / parallelism settings -- ###
+#########################################################
+use_torch_fsdp2: False # it's either this or the next 4 args
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+expert_model_parallel_size: 4
+context_parallel_size: 1
+sequence_parallel: True
+
+
+#################################
+### -- Distributed backend -- ###
+#################################
+distributed_backend: nccl
+distributed_timeout_minutes: 20
+
+
+####################################
+### -- Checkpointing settings -- ###
+####################################
+ckpt_format: "torch_dist"
+async_save: True
+# TODO MAKE ENVIRONMENT AGNOSTIC
+load: /scratch/project_462000963/users/rluukkon/git/oellm_pretrain/checkpoints/qwen3_a400M_2B
+save: /scratch/project_462000963/users/rluukkon/git/oellm_pretrain/checkpoints/qwen3_a400M_2B 
+save_interval: 2000
